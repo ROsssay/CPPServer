@@ -4,43 +4,56 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <future>
 
 #include <windows.h>
 
-// [][][][][]		[][][][][][]		[][][][][][]	[][][][][]
-
-
-int32 buffer[10000][10000];
+atomic<bool> flag = false;
 
 int main()
 {
-	memset(buffer, 0, sizeof(buffer));
+	flag = false;
 
+	flag.store(true, memory_order::memory_order_seq_cst);
+
+	bool val = flag.load(memory_order::memory_order_seq_cst);
+
+	//이전 flag 값을 prev에 넣고, flag값을 수정
 	{
-		uint64 start = GetTickCount64();
-
-		int64 sum = 0;
-
-		for (int32 i = 0; i < 10000; i++)
-			for (int32 j = 0; j < 10000; j++)
-				sum += buffer[i][j];
-
-		uint64 end = GetTickCount64();
-
-		cout << (end - start) << endl;
+		bool prev = flag.exchange(true);
+		//bool prev = flag;
+		//flag = true;
 	}
 
+	// CAS (Compare-And-Swap) 조건부 수정
 	{
-		uint64 start = GetTickCount64();
+		bool expected = false;
+		bool desired = true;
 
-		int64 sum = 0;
+		flag.compare_exchange_strong(expected, desired);
+		//의사코드 비교
+		if (flag == expected)
+		{
+			//expected = flag;
+			flag = desired;
+			return true;
+		}
+		else
+		{
+			expected = flag;
+			return false;
+		}
+		// CAS는 원자적으로 한번에 일어남
 
-		for (int32 i = 0; i < 10000; i++)
-			for (int32 j = 0; j < 10000; j++)
-				sum += buffer[j][i];
+		while (true)
+		{
+			bool expected = false;
+			bool desired = true;
+			flag.compare_exchange_weak(expected, desired);
+		}
 
-		uint64 end = GetTickCount64();
-
-		cout << (end - start) << endl;
+		// 다른 쓰레드의 interruption을 받아서 중간에 실패할 수 있음 strong은 실패시 반복함(strong 버전이 좀 더 부하가 있는 버전임)
+		// weak는 그래서 while문으로 무한반복을 시켜주는 것이 일반적임
+		// 두 버전의 차이는 별로 없음 생각보다
 	}
 }
