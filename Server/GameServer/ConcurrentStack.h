@@ -5,8 +5,6 @@
 
 template<typename T>
 
-// std::move >> 복사 없이 데이터를 그대로 전달하는 방법
-
 class LockStack
 {
 public:
@@ -29,19 +27,12 @@ public:
 		if (_stack.empty())
 			return false;
 
-		// 일반적 싱글스레드 : empty > top > pop
-
 		value = std::move(_stack.top());
 		_stack.pop();
-		// C#이나 C에서는 Pop으로 바로 꺼내올 수 있는데
-		// C++에서는 한번 엿보고 꺼내오는 방식을 씀. why?
-		// 한번에 데이터를 꺼내온다고 하면, 데이터를 꺼내오는 순간에 exception이 일어날 수 있음.
-		// stack, queue가 깨져버릴 수 있기 때문에, 위와 두단계를 걸치는 구조를 사용함
-		// 사실 게임에서는 데이터를 꺼내다가 데이터가 고갈나서 크래쉬가 난다면 그냥 뻗게 냅두는게 더 좋다.
 		return true;
 	}
 
-	void WaitPop(T& value)			// 우아하게 무한정 데이터를 기다리는게 아니라, 데이터가 있을 때만 사용할 수 있다. ☆waitpop
+	void WaitPop(T& value)	
 	{
 		unique_lock<mutex> lock(_mutex);
 		_condVar.wait(lock, [this] {return _stack.empty() == false; });
@@ -61,152 +52,153 @@ private:
 	mutex _mutex;
 	condition_variable _condVar;
 };
+//
+//template<typename T>
+//class LockFreeStack
+//{
+//	struct Node
+//	{
+//		Node(const T& value) : data(make_shared<T>(value)), next(nullptr)
+//		{
+//
+//		}
+//
+//		shared_ptr<T> data;
+//		shared_ptr<Node> next;
+//	};
+//
+//public:
+//	void Push(const T& value)
+//	{
+//		shared_ptr<Node> node = make_shared<Node>(value);		// 문제 shared_ptr가 lock-free 방식으로 작동하지 않음 LockFreeStack은 거짓말이된다
+//		node->next = std::atomic_load(&_head);
+//		while (std::atomic_compare_exchange_weak(&_head, &node->next, node) == false)
+//		{
+//		}
+//	}
+//
+//
+//	shared_ptr<T> TryPop()
+//	{
+//		shared_ptr<Node> oldHead = std::atomic_load(&_head);
+//
+//		while (oldHead && std::atomic_compare_exchange_weak(&_head, &oldHead, oldHead->next) == false)
+//		{
+//
+//		}
+//
+//		if (oldHead == nullptr)
+//			return shared_ptr<T>();
+//
+//		return oldHead->data;
+//		
+//	}
+//
+//private:
+//	shared_ptr<Node> _head;
+//};
+
+// 
 
 template<typename T>
-class LockFreeStack
+class LockFreeStack				// 콘큐런시 액션 책에서 나온 로직 ☆lock-free 프로그래밍은 니들 생각나는대로 하지마라
 {
+	struct Node;
+
+	struct CountedNodePtr
+	{
+		int32 externalCount = 0;
+		Node* ptr = nullptr;
+	};
+
 	struct Node
 	{
-		Node(const T& value) : data(value)
+		Node(const T& value) : data(make_shared<T>(value))
 		{
 
 		}
 
-		T data;
-		Node* next;
+		shared_ptr<T> data;
+		atomic<int32> internalCount = 0;
+		CountedNodePtr next;
 	};
 
 public:
-	
-	// 1) 새 노드를 만들고
-	// 2) 새 노드의 NEXT = HEAD
-	// 3) head = 새 노드
-
-	// [ ][ ][ ][ ][ ][ ][ ][ ]
-	// [head]
 	void Push(const T& value)
 	{
-		Node* node = new Node(value);
-		node->next = _head;
-
-		while (_head.compare_exchange_weak(node->next, node) == false)
+		CountedNodePtr node;
+		node.ptr = new Node(value);
+		node.externalCount = 1;
+		// [!]
+		node.ptr->next = _head;
+		while (_head.compare_exchange_weak(node.ptr->next, node) == false)
 		{
-
 		}
-
-
-		// 이 사이에 새치기 당하면?
-		// _head = node;
 	}
 
 
-	// 1) head 읽기
-	// 2) head->next 읽기
-	// 3) head = head->next
-	// 4) data 추출해서 반환
-	// 5) 추출한 노드 삭제
-
-	bool TryPop(T& value)
+	shared_ptr<T> TryPop()			// 정말로 lock-based 방식보다 빠른가? 경합이 붙었을때, 모든 로직을 다시 처음부터 실행해야 하는 경우가 빈번하게 생김.
+									// Lock-free는 알고만 있어라 버려도 된다
 	{
-		++_popCount;
-
-		Node* oldHead = _head;
-
-		while (oldHead && _head.compare_exchange_weak(oldHead, oldHead->next) == false)
+		CountedNodePtr oldHead = _head;
+		while (true)
 		{
+			// 참조권 획득 (externalCount를 현 시점 기준 +1한 애가 이김)
+			IncreaseHeadCount(oldHead);		// 은행 번호표 생각하면 쉬움
+			// 최소한 externalCount >= 2 일테니 삭제X (안전하게 접근할 수 있는 상태)
+			Node* ptr = oldHead.ptr;
 
-		}
+			// 데이터 없음
+			if (ptr == nullptr)
+				return shared_ptr<T>();
 
-		if (oldHead == nullptr)
-		{
-			--_popCount;
-			return false;
-		}
-
-		value = oldHead->data;
-
-		TryDelete(oldHead);
-
-		return true;
-	}
-
-	// 1) 데이터 분리
-	// 2) Count 체크
-	// 3) 나 혼자면 삭제
-	void TryDelete(Node* oldHead)
-	{
-		// 나 외에 누가 있는가?
-
-		if (_popCount == 1)
-		{
-			// 나 혼자네?
-
-			// 이왕 혼자인거, 삭제 예약된 다른 데이터들도 삭제해보자
-			Node* node = _pendingList.exchange(nullptr);
-
-			if (--_popCount == 0) // popCount 자체가 atomic이기 때문에 atomic하게 연산이 일어나서 괜찮음
+			// 소유권 획득 (ptr->next로 head를 바꿔치기 한 애가 이김)
+			if (_head.compare_exchange_strong(oldHead, ptr->next))
 			{
-				// 끼어든 애가 없음 -> 삭제 진행
-				// 이제와서 끼어들어도, 어차피 데이터는 분리해둔 상태~!
-				DeleteNodes(node);
+				shared_ptr<T> res;
+				res.swap(ptr->data);
+
+				// 데이터를 꺼내 쓰는것까지는 좋았는데, 데이터를 꺼낸 Node를 삭제해도 되는가?
+
+				// external : 1 -> 2(+1) -> 4(나+1 남+2)
+				// internal : 1 -> 0
+
+				// 나 말고 또 누가 있는가?
+				const int32 countIncrease = oldHead.externalCount - 2;
+
+				if (ptr->internalCount.fetch_add(countIncrease) == -countIncrease)
+					delete ptr;
+
+				return res;
 			}
-			else if (node)
+			else if(ptr->internalCount.fetch_sub(1) == 1)
 			{
-				// 누가 끼어들었으니 다시 갖다 놓자
-				ChainPendingNodeList(node);
+				// 참조권은 얻었으나, 소유권은 실패 -> 뒷수습은 내가한다.
+				delete ptr;
 			}
-
-			// 내 데이터는 삭제
-			delete oldHead;
-		}
-		else
-		{
-			// 누가 있네? 그럼 지금 삭제하지 않고, 삭제 예약만
-			ChainPendingNode(oldHead);
-			--_popCount;
-		}
-	}
-
-	// [ ][ ][ ][ ][ ][ ][ ] -> [ ] [ ] [ ] [ ]
-
-	// [ ] [ ] [ ] [ ]
-	void ChainPendingNodeList(Node* first, Node* last)
-	{
-		last->next = _pendingList;
-
-		while (_pendingList.compare_exchange_weak(last->next, first) == false)
-		{
-		}
-	}
-
-	void ChainPendingNodeList(Node* node)
-	{
-		Node* last = node;
-		while (last->next)
-			last = last->next;
-
-		ChainPendingNodeList(node, last);
-	}
-
-	void ChainPendingNode(Node* node)
-	{
-		ChainPendingNodeList(node, node);
-	}
-
-	static void DeleteNodes(Node* node)
-	{
-		while (node)
-		{
-			Node* next = node->next;
-			delete node;
-			node = next;
 		}
 	}
 
 private:
-	atomic<Node*> _head;
 
-	atomic<uint32> _popCount = 0; // Pop을 실행중인 쓰레드 개수
-	atomic<Node*> _pendingList; // 삭제 되어야 할 노드들 (첫번째 노드)
+	void IncreaseHeadCount(CountedNodePtr& oldCounter)
+	{
+		while (true)
+		{
+			CountedNodePtr newCounter = oldCounter;
+			newCounter.externalCount++;
+
+			if (_head.compare_exchange_strong(oldCounter, newCounter))
+			{
+				oldCounter.externalCount = newCounter.externalCount;
+				break;
+			}
+
+
+		}
+	}
+
+private:
+	atomic<CountedNodePtr> _head;
 };
 
