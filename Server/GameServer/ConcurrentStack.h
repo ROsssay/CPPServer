@@ -106,10 +106,10 @@ public:
 	// 4) data 추출해서 반환
 	// 5) 추출한 노드 삭제
 
-	// [ ][ ][ ][ ][ ][ ][ ][ ]
-	// [head]
 	bool TryPop(T& value)
 	{
+		++_popCount;
+
 		Node* oldHead = _head;
 
 		while (oldHead && _head.compare_exchange_weak(oldHead, oldHead->next) == false)
@@ -118,22 +118,95 @@ public:
 		}
 
 		if (oldHead == nullptr)
+		{
+			--_popCount;
 			return false;
+		}
 
-		// Exception X
 		value = oldHead->data;
 
-		// 잠시 삭제 보류
-		//delete oldHead;
-
-		// C#, Java 같이 GC가 있으면 여기서 끝
+		TryDelete(oldHead);
 
 		return true;
 	}
 
+	// 1) 데이터 분리
+	// 2) Count 체크
+	// 3) 나 혼자면 삭제
+	void TryDelete(Node* oldHead)
+	{
+		// 나 외에 누가 있는가?
+
+		if (_popCount == 1)
+		{
+			// 나 혼자네?
+
+			// 이왕 혼자인거, 삭제 예약된 다른 데이터들도 삭제해보자
+			Node* node = _pendingList.exchange(nullptr);
+
+			if (--_popCount == 0) // popCount 자체가 atomic이기 때문에 atomic하게 연산이 일어나서 괜찮음
+			{
+				// 끼어든 애가 없음 -> 삭제 진행
+				// 이제와서 끼어들어도, 어차피 데이터는 분리해둔 상태~!
+				DeleteNodes(node);
+			}
+			else if (node)
+			{
+				// 누가 끼어들었으니 다시 갖다 놓자
+				ChainPendingNodeList(node);
+			}
+
+			// 내 데이터는 삭제
+			delete oldHead;
+		}
+		else
+		{
+			// 누가 있네? 그럼 지금 삭제하지 않고, 삭제 예약만
+			ChainPendingNode(oldHead);
+			--_popCount;
+		}
+	}
+
+	// [ ][ ][ ][ ][ ][ ][ ] -> [ ] [ ] [ ] [ ]
+
+	// [ ] [ ] [ ] [ ]
+	void ChainPendingNodeList(Node* first, Node* last)
+	{
+		last->next = _pendingList;
+
+		while (_pendingList.compare_exchange_weak(last->next, first) == false)
+		{
+		}
+	}
+
+	void ChainPendingNodeList(Node* node)
+	{
+		Node* last = node;
+		while (last->next)
+			last = last->next;
+
+		ChainPendingNodeList(node, last);
+	}
+
+	void ChainPendingNode(Node* node)
+	{
+		ChainPendingNodeList(node, node);
+	}
+
+	static void DeleteNodes(Node* node)
+	{
+		while (node)
+		{
+			Node* next = node->next;
+			delete node;
+			node = next;
+		}
+	}
+
 private:
-	// [ ][ ][ ][ ][ ][ ][ ][ ]
-	// [head]
 	atomic<Node*> _head;
+
+	atomic<uint32> _popCount = 0; // Pop을 실행중인 쓰레드 개수
+	atomic<Node*> _pendingList; // 삭제 되어야 할 노드들 (첫번째 노드)
 };
 
